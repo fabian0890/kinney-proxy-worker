@@ -12,16 +12,12 @@
 	},
 	"compatibility_flags": ["nodejs_compat"],
   
-	/**
-	 * Environment Variables (NO sensibles)
-	 * - Aquí van URLs base, flags, etc.
-	 * - NO pongas tokens aquí.
-	 */
 	"vars": {
 	  "KPH_BASE_URL": "https://stage.kinneydrugs.com",
 	  "SYNERIO_BASE_URL": "https://engage-api-ctest.synerio.com",
 	  "HEROKU_BASE_URL": "https://kinney-drugs-mobile-app-e34533420f49.herokuapp.com",
-	  "SFMC_BASE_URL": "https://cloud.communications.kinneydrugs.com"
+	  "SFMC_BASE_URL": "https://cloud.communications.kinneydrugs.com",
+	  "ALLOWED_ORIGINS": "http://localhost:8100,https://client.hivegroup.nyc"
 	}
   
 	/**
