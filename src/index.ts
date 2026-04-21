@@ -4,11 +4,14 @@ export interface Env {
 	SYNERIO_BEARER: string;
 	HEROKU_API_KEY: string;
 	SFMC_BEARER: string;
+	SF_CLIENT_ID: string;
+  	SF_CLIENT_SECRET: string;
   
 	KPH_BASE_URL: string;
 	SYNERIO_BASE_URL: string;
 	SFMC_BASE_URL: string;
 	HEROKU_BASE_URL: string;
+	SALESFORCE_BASE_URL: string;
 	KPH_PROXY_KEY: string;
   
 	// Vars
@@ -47,8 +50,6 @@ export interface Env {
   }
   
   function safeJoinUrl(base: string, pathAndQuery: string) {
-	// base: https://host
-	// pathAndQuery: /kph/.. ?x=1
 	const baseUrl = new URL(base);
 	const target = new URL(pathAndQuery, baseUrl);
 	return target.toString();
@@ -66,7 +67,6 @@ export interface Env {
   async function forward(req: Request, targetUrl: string, extraHeaders: Record<string, string>) {
 	const headers = cloneHeadersForUpstream(req);
   
-	// overwrite and inject secrets
 	for (const [k, v] of Object.entries(extraHeaders)) {
 	  headers.set(k, v);
 	}
@@ -79,9 +79,7 @@ export interface Env {
 	};
   
 	const upstreamResp = await fetch(targetUrl, init);
-  
 	const respHeaders = new Headers(upstreamResp.headers);
-	// respHeaders.delete("set-cookie"); // 
   
 	return new Response(upstreamResp.body, {
 	  status: upstreamResp.status,
@@ -89,12 +87,93 @@ export interface Env {
 	  headers: respHeaders,
 	});
   }
+
+  async function readJsonBody(req: Request): Promise<any | null> {
+	try {
+	  const text = await req.text();
+	  if (!text) return null;
+	  return JSON.parse(text);
+	} catch {
+	  return null;
+	}
+  }
+  
+  async function getSalesforceAccessToken(env: Env) {
+	const tokenUrl = `${env.SALESFORCE_BASE_URL}/services/oauth2/token`;
+  
+	const body = new URLSearchParams();
+	body.set("grant_type", "client_credentials");
+	body.set("client_id", env.SF_CLIENT_ID);
+	body.set("client_secret", env.SF_CLIENT_SECRET);
+  
+	const resp = await fetch(tokenUrl, {
+	  method: "POST",
+	  headers: {
+		"Content-Type": "application/x-www-form-urlencoded",
+	  },
+	  body: body.toString(),
+	});
+  
+	const data = await resp.json().catch(() => null);
+  
+	if (!resp.ok || !data?.access_token) {
+	  throw new Error(`SALESFORCE_TOKEN_FAILED_${resp.status}: ${JSON.stringify(data)}`);
+	}
+  
+	return {
+	  accessToken: data.access_token as string,
+	  instanceUrl: (data.instance_url as string) || env.SALESFORCE_BASE_URL,
+	};
+  }
+  
+  async function createSalesforceCase(env: Env, casePayload: any) {
+	const { accessToken, instanceUrl } = await getSalesforceAccessToken(env);
+  
+	const url = `${instanceUrl}/services/data/v60.0/sobjects/Case/`;
+  
+	const resp = await fetch(url, {
+	  method: "POST",
+	  headers: {
+		"Authorization": `Bearer ${accessToken}`,
+		"Content-Type": "application/json",
+	  },
+	  body: JSON.stringify(casePayload),
+	});
+  
+	const data = await resp.json().catch(() => null);
+  
+	if (!resp.ok) {
+	  throw new Error(`SALESFORCE_CASE_CREATE_FAILED_${resp.status}: ${JSON.stringify(data)}`);
+	}
+  
+	return data;
+  }
+  
+  function validateGetHelpPayload(body: any) {
+	const requiredFields = [
+	  "Type",
+	  "Description",
+	  "hg_First_Name__c",
+	  "hg_Last_Name__c",
+	  "SuppliedEmail",
+	  "SuppliedPhone",
+	  "Status",
+	  "Origin",
+	];
+  
+	for (const field of requiredFields) {
+	  if (!String(body?.[field] ?? "").trim()) {
+		return `Missing required field: ${field}`;
+	  }
+	}
+  
+	return null;
+  } 
   
   export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
 	  const cors = buildCorsHeaders(req, env);
   
-	  // Preflight
 	  if (req.method.toUpperCase() === "OPTIONS") {
 		return new Response(null, { status: 204, headers: cors });
 	  }
@@ -102,6 +181,37 @@ export interface Env {
 	  const url = new URL(req.url);
 	  const pathname = url.pathname;
   
+	  try {
+		// =========================================================
+		// Special route: Salesforce Get Help
+		// POST /proxy/salesforce/get-help
+		// =========================================================
+		if (pathname === "/proxy/salesforce/get-help" && req.method.toUpperCase() === "POST") {
+		  const body = await readJsonBody(req);
+  
+		  if (!body) {
+			return json(400, { error: "Missing body" }, cors);
+		  }
+  
+		  const validationError = validateGetHelpPayload(body);
+		  if (validationError) {
+			return json(400, { error: validationError }, cors);
+		  }
+  
+		  const sfResp = await createSalesforceCase(env, body);
+  
+		  return json(
+			200,
+			{
+			  result: "ok",
+			  salesforceId: sfResp?.id || null,
+			  success: sfResp?.success ?? true,
+			  errors: sfResp?.errors ?? [],
+			},
+			cors
+		  );
+		}
+
 	  // allowed:
 	  // /proxy/kph/<path...>
 	  // /proxy/synerio/<path...>
@@ -116,10 +226,8 @@ export interface Env {
 	  const service = m[1];
 	  const restPath = m[2] || "/";
   
-	  // Incluye querystring
 	  const pathAndQuery = restPath + (url.search || "");
   
-	  try {
 		let targetUrl = "";
 		let extraHeaders: Record<string, string> = {};
   
@@ -127,24 +235,21 @@ export interface Env {
 			targetUrl = safeJoinUrl(env.KPH_BASE_URL, pathAndQuery);
 			extraHeaders = {
 				"KPH-Agent": env.KPH_AGENT,
-				"X-Kinney-Proxy-Signature": env.KPH_PROXY_KEY
+				"X-Kinney-Proxy-Signature": env.KPH_PROXY_KEY,
 			};	
-		} 
-		else if (service === "synerio") {
+		} else if (service === "synerio") {
 		  targetUrl = safeJoinUrl(env.SYNERIO_BASE_URL, pathAndQuery);
 		  extraHeaders = {
 			Authorization: `Bearer ${env.SYNERIO_BEARER}`,
 			"Content-Type": "application/json",
 		  };
-		} 
-		else if (service === "sfmc") {
+		} else if (service === "sfmc") {
 			targetUrl = safeJoinUrl(env.SFMC_BASE_URL, pathAndQuery);
 			extraHeaders = {
 			  Authorization: `Bearer ${env.SFMC_BEARER}`,
 			  "Content-Type": "application/json",
 			};
-		} 
-		else if (service === "heroku") {
+		} else if (service === "heroku") {
 		  targetUrl = safeJoinUrl(env.HEROKU_BASE_URL, pathAndQuery);
 		  extraHeaders = {
 			"x-api-key": env.HEROKU_API_KEY,
@@ -153,7 +258,6 @@ export interface Env {
   
 		const upstream = await forward(req, targetUrl, extraHeaders);
   
-		// Añadimos CORS al response final
 		const finalHeaders = new Headers(upstream.headers);
 		for (const [k, v] of Object.entries(cors)) finalHeaders.set(k, v);
   
